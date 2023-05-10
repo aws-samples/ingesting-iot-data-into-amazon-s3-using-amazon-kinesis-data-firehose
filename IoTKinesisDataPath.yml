@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy IoT-Firehose-S3 data pipeline resources.
+
+Parameters:
+  IotKinesisRuleSQL:
+    Type: String
+    Description: IoT Rule SQL query to log payloads to an S3 Bucket.
+    Default: SELECT *, topic(3) AS containerId FROM 'device/data/+'
+
+Resources:
+  IoTLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+      LoggingConfiguration:
+        LogFilePrefix: logs
+
+  MetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - 
+          AttributeName: "containerId"
+          AttributeType: "S"
+      KeySchema:
+        - 
+          AttributeName: "containerId"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      
+  IoTToFirehoseRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      TopicRulePayload:
+        Actions:
+          - 
+            Firehose:
+              RoleArn:
+                !GetAtt IoTFirehosePutRecordRole.Arn
+              DeliveryStreamName:
+                !Ref FirehoseDeliveryStream
+              Separator: "\n"
+        AwsIotSqlVersion: '2016-03-23'
+        Description: This rule logs IoT payloads to S3 Bucket by aggregating in Kinesis Firehose.
+        RuleDisabled: false
+        Sql:
+          !Ref IotKinesisRuleSQL
+          
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt IoTLogBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        Prefix: device-data/
+        RoleARN: !GetAtt FirehosePutS3Role.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors: 
+            - Type: Lambda
+              Parameters: 
+                - ParameterName: LambdaArn
+                  ParameterValue: !Sub '${FirehoseTransformLambda.Arn}:$LATEST'
+                - ParameterName: RoleArn
+                  ParameterValue: !GetAtt FirehoseLambdaInvokeRole.Arn
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+
+  FirehoseTransformLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.function_handler
+      Runtime: python3.9
+      Role: !GetAtt TransformLambdaRole.Arn
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      Environment :
+        Variables :
+          METADATA_TABLE : !Ref MetadataTable
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import json
+          import base64
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['METADATA_TABLE'])
+          records = []
+
+          def function_handler(event, context):
+            for record in event["records"]:
+              # Get data field of the record in json format. It is a base64 encoded string.
+              json_data = json.loads(base64.b64decode(record["data"]))
+              container_id = json_data["containerId"]
+
+              # Get corresponding shipId from the DynamoDB table
+              res = table.get_item(Key={'containerId': container_id})
+              ddb_item = res["Item"]
+              ship_id = ddb_item["shipId"]
+
+              # Append shipId to the actual record data
+              enriched_data = json_data
+              enriched_data["shipId"] = ship_id
+
+              # Encode the enriched record to base64
+              json_string = json.dumps(enriched_data).encode("ascii")
+              b64_encoded_data = base64.b64encode(json_string).decode("ascii")
+
+              # Create a record with enriched data and return back to Firehose
+              rec = {'recordId': record["recordId"], 'result': 'Ok', 'data': b64_encoded_data}
+              records.append(rec)
+            return {'records': records}
+
+  IoTFirehosePutRecordRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: 
+                - "iot.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        -
+          PolicyName: "iot-firehose-put"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: Allow
+                Action: firehose:PutRecord
+                Resource: !GetAtt FirehoseDeliveryStream.Arn
+
+  FirehosePutS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: 
+                - "firehose.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        -
+          PolicyName: "firehose-s3-put"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "s3:PutObject"
+                Resource: 
+                  !Join
+                    - "/"
+                    - - !GetAtt IoTLogBucket.Arn
+                      - "*"
+
+  FirehoseLambdaInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: 
+                - "firehose.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        -
+          PolicyName: "invoke-lambda"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: Allow
+                Action: 
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub '${FirehoseTransformLambda.Arn}:*'
+
+  TransformLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        -
+          PolicyName: "dynamodb_access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: Allow
+                Action: 
+                  - dynamodb:GetItem
+                Resource: !GetAtt MetadataTable.Arn
+                
+Outputs:
+  IoTLogS3BucketName:
+    Description: S3 Bucket where IoT logs are stored.
+    Value:
+      !Ref IoTLogBucket
+  MetadataTableName:
+    Description: DynamoDB table where metadata is stored.
+    Value:
+      !Ref MetadataTable
